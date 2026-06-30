@@ -7,6 +7,9 @@ from tkinter import ttk, filedialog, messagebox
 import threading, os, io, time, json, urllib.request, urllib.parse
 from PIL import Image
 from aip import AipOcr
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+import shutil
 
 # ============ 百度OCR配置 ============
 APP_ID = '123759398'
@@ -61,6 +64,7 @@ class VinBatchApp:
         self.folder_path = tk.StringVar()
         self.running = False
         self._stop = False
+        self.validate_var = tk.BooleanVar(value=True)
         
         self._build_ui()
     
@@ -73,6 +77,13 @@ class VinBatchApp:
         self.folder_entry = ttk.Entry(top, textvariable=self.folder_path, width=60)
         self.folder_entry.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
         ttk.Button(top, text='选择文件夹', command=self._select_folder).pack(side=tk.LEFT, padx=5)
+        
+        # === VIN校验开关 ===
+        opt = ttk.Frame(self.root, padding=5)
+        opt.pack(fill=tk.X)
+        self.validate_cb = ttk.Checkbutton(opt, text='VIN校验（关闭时仅提取VIN，不校验合法性）',
+                                           variable=self.validate_var)
+        self.validate_cb.pack(side=tk.LEFT, padx=5)
         
         # === 中间：按钮 ===
         mid = ttk.Frame(self.root, padding=5)
@@ -147,6 +158,7 @@ class VinBatchApp:
         
         try:
             client = AipOcr(APP_ID, API_KEY, SECRET_KEY)
+            client._timeout = 60
         except Exception as e:
             self._log(f'初始化百度OCR失败: {e}', 'fail')
             self._finish_batch()
@@ -166,7 +178,6 @@ class VinBatchApp:
         self._log(f'输出目录: {folder}', 'info')
         self._log('-' * 60, 'info')
         
-        out_lines = []
         results = {'total': len(pdf_files), 'ok': 0, 'fail': 0, 'details': []}
         
         self.progress['maximum'] = len(pdf_files)
@@ -214,15 +225,20 @@ class VinBatchApp:
                 elapsed = round(time.time() - file_start, 2)
                 
                 if vin_found:
-                    v_result = validate_vin(vin_found)
-                    status = '通过' if v_result['valid'] else '失败'
-                    tag = 'ok' if v_result['valid'] else 'fail'
-                    reason = ''
-                    if not v_result['valid'] and v_result['errors']:
-                        reason = f' ({"; ".join(v_result["errors"])})'
+                    if self.validate_var.get():
+                        v_result = validate_vin(vin_found)
+                        status = '通过' if v_result['valid'] else '失败'
+                        tag = 'ok' if v_result['valid'] else 'fail'
+                        reason = ''
+                        if not v_result['valid'] and v_result['errors']:
+                            reason = f' ({"; ".join(v_result["errors"])})'
+                    else:
+                        v_result = {'valid': True, 'errors': []}
+                        status = '已提取'
+                        tag = 'ok'
+                        reason = '（未校验）'
                     self._log(f'  [{fname}] VIN={vin_found} {status}{reason} [{elapsed}s]', tag)
                     
-                    out_lines.append(f'{fname}\t{vin_found}\t{status}{reason}')
                     results['details'].append({
                         'file': fname, 'vin': vin_found, 'valid': v_result['valid'],
                         'errors': v_result['errors'], 'time': elapsed
@@ -231,9 +247,25 @@ class VinBatchApp:
                         results['ok'] += 1
                     else:
                         results['fail'] += 1
+                    
+                    # 无论校验是否通过，都用VIN后六位重命名PDF
+                    new_name = vin_found[-6:] + '.pdf'
+                    src = fpath
+                    dst = os.path.join(folder, new_name)
+                    if os.path.exists(dst):
+                        n = 1
+                        while True:
+                            new_name = f"{vin_found[-6:]}_{n}.pdf"
+                            dst = os.path.join(folder, new_name)
+                            if not os.path.exists(dst):
+                                break
+                            n += 1
+                    shutil.move(src, dst)
+                    self._log(f'  -> 已重命名为: {new_name}', 'ok')
+                    # 更新details中的文件名
+                    results['details'][-1]['file'] = new_name
                 else:
                     self._log(f'  [{fname}] 未识别到VIN [{elapsed}s]', 'fail')
-                    out_lines.append(f'{fname}\tN/A\t未识别到VIN')
                     results['details'].append({
                         'file': fname, 'vin': '', 'valid': False,
                         'errors': ['未识别到VIN'], 'time': elapsed
@@ -243,7 +275,6 @@ class VinBatchApp:
             except Exception as e:
                 elapsed = round(time.time() - file_start, 2)
                 self._log(f'  [{fname}] 错误: {e} [{elapsed}s]', 'fail')
-                out_lines.append(f'{fname}\tERROR\t{e}')
                 results['details'].append({
                     'file': fname, 'vin': '', 'valid': False,
                     'errors': [str(e)], 'time': elapsed
@@ -252,29 +283,92 @@ class VinBatchApp:
         
         # 写结果文件
         total_elapsed = round(time.time() - start_time, 2)
-        out_path = os.path.join(folder, 'VIN结果汇总.txt')
+
+        # 创建Excel
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = 'VIN批处理结果'
         
-        header = [
-            '=' * 60,
-            '绿本VIN批处理结果',
-            f'处理时间: {time.strftime("%Y-%m-%d %H:%M:%S")}',
-            f'总耗时: {total_elapsed}s',
-            f'文件总数: {results["total"]}, 通过: {results["ok"]}, 失败: {results["fail"]}',
-            '=' * 60,
-            f'{"文件名":<35}{"VIN码":<22}{"校验结果"}',
-            '-' * 75
-        ]
+        # 样式定义
+        header_font = Font(bold=True, size=12)
+        header_fill = PatternFill(start_color='4472C4', end_color='4472C4', fill_type='solid')
+        header_font_white = Font(bold=True, size=12, color='FFFFFF')
+        ok_fill = PatternFill(start_color='E2EFDA', end_color='E2EFDA', fill_type='solid')
+        fail_fill = PatternFill(start_color='FCE4EC', end_color='FCE4EC', fill_type='solid')
+        thin_border = Border(
+            left=Side(style='thin'), right=Side(style='thin'),
+            top=Side(style='thin'), bottom=Side(style='thin')
+        )
         
-        with open(out_path, 'w', encoding='utf-8') as f:
-            f.write('\n'.join(header) + '\n')
-            f.write('\n'.join(out_lines) + '\n')
-            f.write('-' * 75 + '\n')
-            f.write(f'总计: {results["total"]}, 通过: {results["ok"]}, 失败: {results["fail"]}\n')
+        # 标题行
+        title_row = ['文件名', 'VIN码', 'VIN后六位', '校验结果', '备注', '耗时(秒)']
+        for col, h in enumerate(title_row, 1):
+            cell = ws.cell(row=1, column=col, value=h)
+            cell.font = header_font_white
+            cell.fill = header_fill
+            cell.alignment = Alignment(horizontal='center', vertical='center')
+            cell.border = thin_border
+        
+        # 数据行
+        for i, d in enumerate(results['details'], 2):
+            status = '有效' if d['valid'] else '无效'
+            reason = '; '.join(d['errors']) if d['errors'] else ''
+            vin_last6 = d['vin'][-6:] if len(d['vin']) >= 6 else d['vin']
+            ws.cell(row=i, column=1, value=d['file']).border = thin_border
+            ws.cell(row=i, column=2, value=d['vin']).border = thin_border
+            ws.cell(row=i, column=3, value=vin_last6).border = thin_border
+            ws.cell(row=i, column=4, value=status).border = thin_border
+            ws.cell(row=i, column=5, value=reason).border = thin_border
+            ws.cell(row=i, column=6, value=d['time']).border = thin_border
+            # 颜色标记
+            fill = ok_fill if d['valid'] else fail_fill
+            for col in range(1, 7):
+                ws.cell(row=i, column=col).fill = fill
+        
+        # 汇总行
+        summary_row = len(results['details']) + 2
+        ws.cell(row=summary_row, column=1, value='汇总').font = Font(bold=True)
+        ws.cell(row=summary_row, column=1).border = thin_border
+        ws.merge_cells(start_row=summary_row, start_column=2, end_row=summary_row, end_column=6)
+        summary_text = f'总计: {results["total"]}, 有效: {results["ok"]}, 无效: {results["fail"]}  处理时间: {time.strftime("%Y-%m-%d %H:%M:%S")}  总耗时: {total_elapsed}s'
+        cell = ws.cell(row=summary_row, column=2, value=summary_text)
+        cell.font = Font(bold=True)
+        cell.border = thin_border
+        for col in range(3, 7):
+            ws.cell(row=summary_row, column=col).border = thin_border
+        
+        # 列宽
+        ws.column_dimensions['A'].width = 40
+        ws.column_dimensions['B'].width = 22
+        ws.column_dimensions['C'].width = 12
+        ws.column_dimensions['D'].width = 10
+        ws.column_dimensions['E'].width = 30
+        ws.column_dimensions['F'].width = 12
+        
+        xlsx_path = os.path.join(folder, 'VIN结果汇总.xlsx')
+        wb.save(xlsx_path)
+        
+        # 移动失败PDF到"失败"文件夹
+        fail_dir = os.path.join(folder, '失败')
+        if results['fail'] > 0:
+            os.makedirs(fail_dir, exist_ok=True)
+            moved = 0
+            for d in results['details']:
+                if not d['valid'] and d['file'].lower().endswith('.pdf'):
+                    src = os.path.join(folder, d['file'])
+                    dst = os.path.join(fail_dir, d['file'])
+                    if os.path.exists(src):
+                        shutil.move(src, dst)
+                        moved += 1
+            if moved > 0:
+                self._log(f'已将 {moved} 个失败PDF移至: {fail_dir}', 'info')
         
         self._log('-' * 60, 'title')
-        self._log(f'处理完成! 总计: {results["total"]}, 通过: {results["ok"]}, 失败: {results["fail"]}', 'title')
+        self._log(f'处理完成! 总计: {results["total"]}, 有效: {results["ok"]}, 无效: {results["fail"]}', 'title')
         self._log(f'总耗时: {total_elapsed}s', 'info')
-        self._log(f'结果文件: {out_path}', 'info')
+        self._log(f'Excel结果文件: {xlsx_path}', 'info')
+        if results['fail'] > 0 and os.path.exists(fail_dir):
+            self._log(f'失败PDF已移至: {fail_dir}', 'info')
         
         # 保存JSON详情
         json_path = os.path.join(folder, 'VIN结果汇总.json')
